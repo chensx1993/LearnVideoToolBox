@@ -36,7 +36,7 @@
     self.mLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, 200, 100)];
     self.mLabel.textColor = [UIColor redColor];
     [self.view addSubview:self.mLabel];
-    self.mLabel.text = @"测试H264硬编码";
+    self.mLabel.text = @"测试H264硬编码(Compress h264)";
     
     UIButton *button = [[UIButton alloc] initWithFrame:CGRectMake(200, 20, 100, 100)];
     [button setTitle:@"play" forState:UIControlStateNormal];
@@ -92,6 +92,7 @@
     [self.mPreviewLayer setFrame:self.view.bounds];
     [self.view.layer addSublayer:self.mPreviewLayer];
     
+//    NSString *file = @"/Users/hsbcnet.mobile.ukhsbcnet.mobile.uk/Desktop/test/abc.h264";
     NSString *file = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) lastObject] stringByAppendingPathComponent:@"abc.h264"];
     [[NSFileManager defaultManager] removeItemAtPath:file error:nil];
     [[NSFileManager defaultManager] createFileAtPath:file contents:nil attributes:nil];
@@ -104,17 +105,12 @@
 - (void)stopCapture {
     [self.mCaptureSession stopRunning];
     [self.mPreviewLayer removeFromSuperlayer];
+    [self endVideoToolBox];
     [fileHandle closeFile];
     fileHandle = NULL;
 }
 
-#pragma mark AVCaptureVideoDataOutputSampleBufferDelegate
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(nonnull CMSampleBufferRef)sampleBuffer fromConnection:(nonnull AVCaptureConnection *)connection {
-    dispatch_sync(mEncodeQueue, ^{
-        [self encode:sampleBuffer];
-    });
-}
-
+#pragma mark - VideoToolBox
 - (void)initVideoToolBox {
     dispatch_sync(mEncodeQueue, ^{
         frameID = 0;
@@ -150,9 +146,25 @@
         CFNumberRef bitRateLimitRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bitRateLimit);
         VTSessionSetProperty(encodingSession, kVTCompressionPropertyKey_DataRateLimits, bitRateLimitRef);
         
+        // Tell the encoder to start encoding
         VTCompressionSessionPrepareToEncodeFrames(encodingSession);
     });
 }
+
+- (void)endVideoToolBox {
+    VTCompressionSessionCompleteFrames(encodingSession, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(encodingSession);
+    CFRelease(encodingSession);
+    encodingSession = NULL;
+}
+
+#pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(nonnull CMSampleBufferRef)sampleBuffer fromConnection:(nonnull AVCaptureConnection *)connection {
+    dispatch_sync(mEncodeQueue, ^{
+        [self encode:sampleBuffer];
+    });
+}
+
 
 - (void)encode:(CMSampleBufferRef)sampleBuffer {
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -187,13 +199,71 @@ void didCompressH264(void *outputCallbackRefCon, void *sourceFrameRefCon, OSStat
     
     // 获取sps & pps数据
     if (keyframe) {
+        // sps
         CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sampleBuffer);
-        size_t sparameterSetSize, sparameterSetCount;
         const uint8_t *sparameterSet;
+        size_t sparameterSetSize, sparameterSetCount;
         OSStatus statusCode = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &sparameterSet, &sparameterSetSize, &sparameterSetCount, 0);
+        
+        
         if (statusCode == noErr) {
-            
+            // pps
+            const uint8_t *pparameterSet;
+            size_t pparameterSetSize, pparameterSetCount;
+            OSStatus statusCode = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 1, &pparameterSet, &pparameterSetSize, &pparameterSetCount, 0);
+            if (statusCode == noErr) {
+                NSData *sps = [NSData dataWithBytes:sparameterSet length:sparameterSetSize];
+                NSData *pps = [NSData dataWithBytes:pparameterSet length:pparameterSetSize];
+                if (encoder) {
+                    [encoder gotSpsPps:sps pps:pps];
+                }
+            }
         }
+    }
+    
+    CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+    size_t length, totalLength;
+    char *dataPointer;
+    OSStatus statusCodeRet = CMBlockBufferGetDataPointer(dataBuffer, 0, &length, &totalLength, &dataPointer);
+    if (statusCodeRet == noErr) {
+        size_t bufferOffset = 0;
+        static const int AVCCHeaderLength = 4;// 返回的nalu数据前四个字节不是0001的startcode，而是大端模式的帧长度length
+        
+        while (bufferOffset < totalLength - AVCCHeaderLength) {
+            uint32_t NALUnitLength = 0;
+            // Read the NAL unit length
+            memcpy(&NALUnitLength, dataPointer + bufferOffset, AVCCHeaderLength);
+            
+            // 从大端字节序 转 系统端
+            NALUnitLength = CFSwapInt32BigToHost(NALUnitLength);
+            
+            NSData *data = [[NSData alloc] initWithBytes:(dataPointer + bufferOffset + AVCCHeaderLength) length:NALUnitLength];
+            [encoder gotEncodedData:data isKeyFrame:keyframe];
+            
+            // Move to the next NAL unit in the block buffer
+            bufferOffset += AVCCHeaderLength + NALUnitLength;
+        }
+    }
+}
+
+- (void)gotSpsPps:(NSData *)sps pps:(NSData *)pps {
+    NSLog(@"gotSpsPps %d %d", (int)[sps length], (int)[pps length]);
+    const char bytes[] = "\x00\x00\x00\x01";
+    size_t length = (sizeof bytes) - 1;//string literals have implicit trailing '\0'
+    NSData *byteHeader = [NSData dataWithBytes:bytes length:length];
+    [fileHandle writeData:byteHeader];
+    [fileHandle writeData:sps];
+    [fileHandle writeData:byteHeader];
+    [fileHandle writeData:pps];
+}
+
+- (void)gotEncodedData:(NSData *)data isKeyFrame:(BOOL)isKeyFrame {
+    if (fileHandle != NULL) {
+        const char bytes[] = "\x00\x00\x00\x01";
+        size_t length = (sizeof bytes) - 1;//string literals have implicit trailing '\0'
+        NSData *byteHeader = [NSData dataWithBytes:bytes length:length];
+        [fileHandle writeData:byteHeader];
+        [fileHandle writeData:data];
     }
 }
 
